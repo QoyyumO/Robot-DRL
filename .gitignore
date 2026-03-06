@@ -21,7 +21,7 @@ build/
 *.swp
 *.swo
 
-# Project outputs (optional: remove if you want to track models/logs)
+# Project outputs
 models/
 logs/
 openvino_ir/
