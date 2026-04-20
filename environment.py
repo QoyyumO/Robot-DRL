@@ -6,7 +6,7 @@ The arm must reach a target object; reward is distance-based.
 
 import os
 import numpy as np
-from typing import Tuple, Any, Optional
+from typing import Tuple, Any, Optional, Sequence
 
 try:
     import pybullet as p
@@ -29,7 +29,7 @@ ACTION_LEFT = 3
 ACTION_RIGHT = 4
 
 # Target reaching: reward = +1 closer, -1 farther, 0 same; terminal when sum(last 3) < -1
-COMPLETION_RADIUS = 0.02  # success when end-effector within this (m) of target (tighter for short arm)
+COMPLETION_RADIUS = 0.08  # success when end-effector within this (m) of target (8 cm demo threshold)
 
 
 class VisionControlEnv:
@@ -50,6 +50,9 @@ class VisionControlEnv:
         camera_width: int = CAMERA_WIDTH,
         camera_height: int = CAMERA_HEIGHT,
         time_step: float = 1.0 / 60.0,
+        target_mode: str = "random",
+        preset_targets: Optional[Sequence[Tuple[float, float, float]]] = None,
+        enable_early_truncation: bool = True,
     ):
         if not HAS_PYBULLET:
             raise RuntimeError("PyBullet is required. Install with: pip install pybullet")
@@ -74,8 +77,31 @@ class VisionControlEnv:
         self._last_3_rewards: list = []
         # Target position in 3D (set at reset)
         self._target_pos_3d: Optional[Tuple[float, float, float]] = None
+        self._target_mode = target_mode
+        self._preset_targets = list(preset_targets) if preset_targets else []
+        self._preset_target_idx = 0
+        self._enable_early_truncation = enable_early_truncation
+        if self._target_mode not in ("random", "preset_cycle"):
+            raise ValueError("target_mode must be 'random' or 'preset_cycle'")
+        if self._target_mode == "preset_cycle" and not self._preset_targets:
+            raise ValueError("preset_targets must be provided when target_mode is 'preset_cycle'")
 
-    def reset(self) -> Tuple[np.ndarray, dict]:
+    def _sample_random_target(self) -> Tuple[float, float, float]:
+        """Sample random target in front of the short 2-link arm."""
+        tx = float(np.random.uniform(0.25, 0.85))
+        ty = float(np.random.uniform(-0.35, 0.35))
+        tz = float(0.05 + np.random.uniform(0, 0.08))
+        return (tx, ty, tz)
+
+    def _next_target_position(self) -> Tuple[float, float, float]:
+        """Return next target according to configured target mode."""
+        if self._target_mode == "preset_cycle":
+            target = tuple(self._preset_targets[self._preset_target_idx % len(self._preset_targets)])
+            self._preset_target_idx += 1
+            return target
+        return self._sample_random_target()
+
+    def reset(self, target_position: Optional[Tuple[float, float, float]] = None) -> Tuple[np.ndarray, dict]:
         """Reset: new target position, arm at default. Obs = target-location image only (no arm)."""
         if self._client_id is not None:
             p.disconnect(self._client_id)
@@ -128,11 +154,8 @@ class VisionControlEnv:
                 self._arm_id, self._joint_indices[j], p.POSITION_CONTROL,
                 targetPosition=self._joint_positions[j], force=100, physicsClientId=self._client_id
             )
-        # Random target in front of short 2-link arm (reach ~1 m): x forward, y lateral, z low
-        tx = np.random.uniform(0.25, 0.85)
-        ty = np.random.uniform(-0.35, 0.35)
-        tz = 0.05 + np.random.uniform(0, 0.08)
-        self._target_pos_3d = (tx, ty, tz)
+        # Allow explicit target override; otherwise sample from configured strategy.
+        self._target_pos_3d = tuple(target_position) if target_position is not None else self._next_target_position()
         # Target sphere at that position (fixed in place)
         try:
             self._target_id = p.loadURDF(
@@ -153,7 +176,12 @@ class VisionControlEnv:
         # DQN observation = full scene (arm + target) 84x84 — image only, no position sensors
         obs = self._get_dqn_obs()
         rgb = self._get_camera_rgb()
-        return obs, {"rgb": rgb, "dqn_obs": obs}
+        return obs, {
+            "rgb": rgb,
+            "dqn_obs": obs,
+            "target_pos": self._target_pos_3d,
+            "ee_pos": self._get_end_effector_pos(),
+        }
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
         """Step: move arm joints (position control). Reward: +1 closer, -1 farther. Terminal when sum(last 3) < -1 or success."""
@@ -205,7 +233,7 @@ class VisionControlEnv:
         # Terminal: sum of last 3 rewards < -1 (Algorithm 1) or success or max_steps
         sum_last_3 = sum(self._last_3_rewards) if len(self._last_3_rewards) >= 3 else 0
         done = self._step_count >= self._max_steps or dist < COMPLETION_RADIUS
-        truncated = sum_last_3 < -1
+        truncated = (sum_last_3 < -1) if self._enable_early_truncation else False
         success = dist < COMPLETION_RADIUS
         if success:
             reward += 5.0  # bonus for reaching target
@@ -218,17 +246,29 @@ class VisionControlEnv:
             "step": self._step_count,
             "distance": dist,
             "success": success,
+            "target_pos": self._target_pos_3d,
+            "ee_pos": self._get_end_effector_pos(),
         }
 
     def _distance_ee_to_target(self) -> float:
         if self._target_pos_3d is None:
             return float("inf")
+        ee = self._get_end_effector_pos()
+        if ee is None:
+            return float("inf")
+        ee_pos = np.array(ee)
+        t = np.array(self._target_pos_3d)
+        return float(np.linalg.norm(ee_pos - t))
+
+    def _get_end_effector_pos(self) -> Optional[Tuple[float, float, float]]:
+        """Current end-effector world position (x, y, z)."""
+        if self._arm_id is None or self._client_id is None:
+            return None
         link_state = p.getLinkState(
             self._arm_id, self.ARM_END_EFFECTOR_LINK, physicsClientId=self._client_id
         )
-        ee_pos = np.array(link_state[0])
-        t = np.array(self._target_pos_3d)
-        return float(np.linalg.norm(ee_pos - t))
+        ee = link_state[0]
+        return (float(ee[0]), float(ee[1]), float(ee[2]))
 
     def _get_view_proj_matrices(self) -> Tuple[np.ndarray, np.ndarray]:
         """Camera view and projection as 4x4 (column-major from PyBullet)."""

@@ -10,8 +10,10 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 import threading
 import queue
-from typing import Optional, Callable, List
+import time
+from typing import Optional, Callable, List, Tuple
 import numpy as np
+from datetime import datetime
 
 # Optional imports: fail gracefully if not installed
 try:
@@ -36,6 +38,15 @@ except ImportError:
 
 
 LOGS_DIR = "logs"
+DEMO_ATTEMPTS = 10
+DEMO_SUCCESS_PAUSE_SECONDS = 0.5
+DEMO_PRESET_TARGETS = [
+    (0.55, 0.00, 0.08),
+    (0.60, 0.12, 0.08),
+    (0.62, -0.10, 0.08),
+    (0.68, 0.05, 0.08),
+    (0.70, -0.08, 0.08),
+]
 
 
 def _save_training_csv(
@@ -100,6 +111,90 @@ def _plot_training_metrics(
         return path
     except Exception:
         return None
+
+
+def _save_openvino_demo_logs(
+    attempts: List[dict],
+    configured_attempts: int,
+    success_pause_seconds: float,
+) -> Tuple[Optional[str], Optional[str]]:
+    """Write demo-mode per-attempt CSV and summary TXT logs."""
+    if not attempts:
+        return None, None
+    try:
+        os.makedirs(LOGS_DIR, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        csv_path = os.path.join(LOGS_DIR, f"openvino_demo_attempts_{stamp}.csv")
+        txt_path = os.path.join(LOGS_DIR, f"openvino_demo_summary_{stamp}.txt")
+
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(
+                [
+                    "attempt",
+                    "target_x",
+                    "target_y",
+                    "target_z",
+                    "start_ee_x",
+                    "start_ee_y",
+                    "start_ee_z",
+                    "final_ee_x",
+                    "final_ee_y",
+                    "final_ee_z",
+                    "success",
+                    "steps",
+                    "terminal_reason",
+                    "final_distance",
+                    "pause_seconds",
+                ]
+            )
+            for row in attempts:
+                tx, ty, tz = row.get("target", (None, None, None))
+                sx, sy, sz = row.get("start_ee", (None, None, None))
+                fx, fy, fz = row.get("final_ee", (None, None, None))
+                writer.writerow(
+                    [
+                        row.get("attempt"),
+                        tx,
+                        ty,
+                        tz,
+                        sx,
+                        sy,
+                        sz,
+                        fx,
+                        fy,
+                        fz,
+                        1 if row.get("success") else 0,
+                        row.get("steps"),
+                        row.get("terminal_reason"),
+                        f"{float(row.get('final_distance', 0.0)):.6f}",
+                        row.get("pause_seconds", 0.0),
+                    ]
+                )
+
+        successes = sum(1 for row in attempts if row.get("success"))
+        completed_attempts = len(attempts)
+        success_steps = [row.get("steps", 0) for row in attempts if row.get("success")]
+        avg_success_steps = float(np.mean(success_steps)) if success_steps else 0.0
+        avg_final_distance = float(np.mean([row.get("final_distance", 0.0) for row in attempts]))
+        success_rate = (100.0 * successes / completed_attempts) if completed_attempts else 0.0
+        failed_attempts = completed_attempts - successes
+
+        with open(txt_path, "w", newline="") as f:
+            f.write("OpenVINO Demo Mode Summary\n")
+            f.write(f"Configured attempts: {configured_attempts}\n")
+            f.write(f"Completed attempts: {completed_attempts}\n")
+            f.write(f"Successes: {successes}\n")
+            f.write(f"Failed attempts: {failed_attempts}\n")
+            f.write(f"Success rate (%): {success_rate:.2f}\n")
+            f.write(f"Average successful steps: {avg_success_steps:.2f}\n")
+            f.write(f"Average final distance (m): {avg_final_distance:.4f}\n")
+            f.write(f"Success pause seconds: {success_pause_seconds:.1f}\n")
+            f.write(f"Attempts CSV: {csv_path}\n")
+
+        return csv_path, txt_path
+    except Exception:
+        return None, None
 
 
 class SimulationViewPanel(ttk.Frame):
@@ -219,6 +314,8 @@ class MainDashboard:
         self._btn_train.pack(side=tk.LEFT, padx=4)
         self._btn_inference = ttk.Button(btn_frame, text="Run OpenVINO Inference", command=self._on_run_inference)
         self._btn_inference.pack(side=tk.LEFT, padx=4)
+        self._btn_demo = ttk.Button(btn_frame, text="Run OpenVINO Demo Mode", command=self._on_run_demo_mode)
+        self._btn_demo.pack(side=tk.LEFT, padx=4)
         self._btn_convert = ttk.Button(btn_frame, text="Convert model → OpenVINO IR", command=self._on_convert_ir)
         self._btn_convert.pack(side=tk.LEFT, padx=4)
         ttk.Button(btn_frame, text="Stop", command=self._on_stop).pack(side=tk.LEFT, padx=4)
@@ -376,31 +473,46 @@ class MainDashboard:
                     pass
             self._simulation_running = False
 
-    def _on_run_inference(self) -> None:
-        """Run OpenVINO inference in a background thread (GPU)."""
+    def _can_start_openvino(self) -> bool:
+        """Validate preconditions before starting inference or demo mode."""
         if self._inference_running:
             messagebox.showinfo("Info", "Inference already running.")
-            return
+            return False
         if not HAS_ENV or not HAS_AGENT:
             messagebox.showwarning(
                 "Missing deps",
                 "Inference requires pybullet and openvino.\nInstall: pip install pybullet openvino",
             )
-            return
+            return False
         if not os.path.isfile(self._openvino_ir_xml):
             messagebox.showinfo(
                 "No IR model",
                 f"OpenVINO IR not found at {self._openvino_ir_xml}. Train and convert:\n"
                 "1. Run Training, then use agent.convert_h5_to_openvino_ir() to create .xml/.bin.",
             )
+            return False
+        return True
+
+    def _on_run_inference(self) -> None:
+        """Run raw OpenVINO inference in a background thread."""
+        if not self._can_start_openvino():
             return
         self._inference_running = True
         self._status_var.set("OpenVINO inference starting…")
         self._worker_thread = threading.Thread(target=self._inference_loop, daemon=True)
         self._worker_thread.start()
 
+    def _on_run_demo_mode(self) -> None:
+        """Run OpenVINO Demo Mode with deterministic targets and fixed attempts."""
+        if not self._can_start_openvino():
+            return
+        self._inference_running = True
+        self._status_var.set("OpenVINO demo mode starting…")
+        self._worker_thread = threading.Thread(target=self._inference_demo_loop, daemon=True)
+        self._worker_thread.start()
+
     def _inference_loop(self) -> None:
-        """Run OpenVINO inference (CPU by default); env provides frames, push to GUI."""
+        """Run OpenVINO inference (continuous raw mode)."""
         env = None
         try:
             env = VisionControlEnv(headless=True)
@@ -425,6 +537,93 @@ class MainDashboard:
             self.push_status("Inference stopped.")
         except Exception as e:
             self.push_status(f"Inference error: {e}")
+        finally:
+            if env is not None:
+                try:
+                    env.close()
+                except Exception:
+                    pass
+            self._inference_running = False
+
+    def _inference_demo_loop(self) -> None:
+        """Run finite OpenVINO demo attempts with deterministic targets and logging."""
+        env = None
+        try:
+            env = VisionControlEnv(
+                headless=True,
+                target_mode="preset_cycle",
+                preset_targets=DEMO_PRESET_TARGETS,
+                enable_early_truncation=False,
+            )
+            ov_agent = OpenVINOInference(self._openvino_ir_xml, device="GPU")
+            
+
+            attempt_rows: List[dict] = []
+            for attempt_idx in range(1, DEMO_ATTEMPTS + 1):
+                if not self._inference_running:
+                    break
+
+                obs, info = env.reset()
+                rgb = info.get("rgb")
+                if rgb is not None:
+                    self.push_frame_update(rgb, dqn_obs=info.get("dqn_obs"))
+                target = tuple(info.get("target_pos", (None, None, None)))
+                start_ee = tuple(info.get("ee_pos", (None, None, None)))
+                final_ee = start_ee
+
+                steps = 0
+                final_distance = float("inf")
+                success = False
+                terminal_reason = "stopped"
+                while self._inference_running:
+                    action = ov_agent.select_action(obs)
+                    obs, _reward, done, truncated, step_info = env.step(action)
+                    rgb = step_info.get("rgb")
+                    if rgb is not None:
+                        self.push_frame_update(rgb, dqn_obs=step_info.get("dqn_obs"))
+                    steps = int(step_info.get("step", steps + 1))
+                    final_distance = float(step_info.get("distance", final_distance))
+                    success = bool(step_info.get("success", False))
+                    final_ee = tuple(step_info.get("ee_pos", final_ee))
+                    if success:
+                        terminal_reason = "success"
+                        break
+                    if truncated:
+                        terminal_reason = "truncated"
+                        break
+                    if done:
+                        terminal_reason = "max_steps"
+                        break
+
+                pause_seconds = DEMO_SUCCESS_PAUSE_SECONDS if success else 0.0
+                attempt_rows.append(
+                    {
+                        "attempt": attempt_idx,
+                        "target": target,
+                        "start_ee": start_ee,
+                        "final_ee": final_ee,
+                        "success": success,
+                        "steps": steps,
+                        "terminal_reason": terminal_reason,
+                        "final_distance": final_distance,
+                        "pause_seconds": pause_seconds,
+                    }
+                )
+                self.push_status(f"Attempt {attempt_idx}/{DEMO_ATTEMPTS} completed")
+
+                if success:
+                    pause_deadline = time.time() + DEMO_SUCCESS_PAUSE_SECONDS
+                    while self._inference_running and time.time() < pause_deadline:
+                        time.sleep(0.1)
+
+            _save_openvino_demo_logs(
+                attempt_rows,
+                configured_attempts=DEMO_ATTEMPTS,
+                success_pause_seconds=DEMO_SUCCESS_PAUSE_SECONDS,
+            )
+            self.push_status("Demo finished.")
+        except Exception as e:
+            print(f"Demo mode error: {e}", flush=True)
         finally:
             if env is not None:
                 try:
