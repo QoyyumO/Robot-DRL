@@ -1,0 +1,85 @@
+# ============================================================
+# Vision-Based Robotic Arm Control — Configuration
+# ============================================================
+
+# --- DQN Training Hyperparameters ---
+dqn:
+  learning_rate: 2.5e-4
+  gamma: 0.99              # discount factor
+  epsilon_start: 1.0
+  epsilon_end: 0.05
+  epsilon_decay_steps: 50000
+  buffer_size: 50000       # replay buffer capacity
+  batch_size: 32
+  target_update_freq: 1000 # steps between target network syncs
+
+# --- Neural Network Architecture ---
+network:
+  dense_units: 512
+  conv_filters: [32, 64, 64]
+  conv_kernels: [8, 4, 3]
+  conv_strides: [4, 2, 1]
+
+# --- Environment / Simulation ---
+environment:
+  camera_width: 320        # raw PyBullet camera resolution
+  camera_height: 240
+  physics_time_step: 0.016667  # seconds per step (1/60 Hz)
+  gravity: -10.0
+  max_steps_per_episode: 500
+  joint_delta: 0.03        # radians per action step
+  joint_force: 100         # motor force (N)
+  completion_radius: 0.08  # success threshold in metres (8 cm)
+  early_truncation_threshold: -1  # truncate when sum(last 3 rewards) < this
+  # Camera view
+  camera_distance: 1.5
+  camera_yaw: 60
+  camera_pitch: -30
+  camera_target: [0.5, 0.0, 0.08]
+  camera_fov: 60
+  # Target sampling bounds
+  target_x_min: 0.25
+  target_x_max: 0.85
+  target_y_min: -0.35
+  target_y_max: 0.35
+  target_z_min: 0.05
+  target_z_range: 0.08     # z is uniformly sampled in [z_min, z_min + z_range]
+
+# --- Reward Shaping ---
+rewards:
+  closer: 1.0
+  farther: -1.0
+  same: 0.0
+  success_bonus: 5.0
+
+# --- Image Preprocessing ---
+preprocessing:
+  width: 84
+  height: 84
+  bilateral_d: 9
+  bilateral_sigma_color: 75.0
+  bilateral_sigma_space: 75.0
+
+# --- File Paths ---
+paths:
+  model_keras: "models/dqn_model.keras"
+  model_h5: "models/dqn_model.h5"
+  openvino_ir_dir: "openvino_ir"
+  openvino_ir_xml: "openvino_ir/dqn_ir.xml"
+  logs_dir: "logs"
+
+# --- Demo Mode ---
+demo:
+  attempts: 10
+  success_pause_seconds: 0.5
+  preset_targets:
+    - [0.55, 0.00, 0.08]
+    - [0.60, 0.12, 0.08]
+    - [0.62, -0.10, 0.08]
+    - [0.68, 0.05, 0.08]
+    - [0.70, -0.08, 0.08]
+
+# --- Evaluation ---
+evaluation:
+  n_runs: 10
+  episodes_per_run: 100
