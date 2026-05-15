@@ -8,10 +8,10 @@ dqn:
   gamma: 0.99              # discount factor
   epsilon_start: 1.0
   epsilon_end: 0.05
-  epsilon_decay_steps: 50000
-  buffer_size: 50000       # replay buffer capacity (transitions)
-  batch_size: 32
-  target_update_freq: 1000 # steps between target network syncs
+  epsilon_decay_steps: 100000  # longer decay: more env steps before exploitation
+  buffer_size: 100000      # larger buffer: more diverse experience for bigger batches
+  batch_size: 256          # T4 has 2560 CUDA cores — batch 32 uses ~1% of them
+  target_update_freq: 1000 # gradient steps between target network syncs
 
 # --- Neural Network Architecture ---
 network:
@@ -64,3 +64,6 @@ preprocessing:
 training:
   checkpoint_every: 100    # save checkpoint every N episodes
   log_every: 10            # print progress every N episodes
+  train_freq: 4            # collect this many env steps before each training round
+  gradient_steps: 2        # gradient updates per training round
+  mixed_precision: true    # FP16 on T4 tensor cores: 65 TFLOPS vs 8.1 TFLOPS FP32

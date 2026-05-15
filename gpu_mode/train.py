@@ -112,10 +112,13 @@ def _plot_training_metrics(
         return None
 
 
-# ── GPU detection ────────────────────────────────────────────────────────────
+# ── GPU setup ────────────────────────────────────────────────────────────────
 
-def _print_gpu_info() -> None:
-    """Print TensorFlow GPU availability so Colab users can confirm the runtime."""
+def _setup_gpu() -> None:
+    """
+    Configure GPU memory growth and confirm the device TF will use.
+    Must be called before any tf.keras model is built.
+    """
     try:
         import tensorflow as tf
         gpus = tf.config.list_physical_devices("GPU")
@@ -123,15 +126,16 @@ def _print_gpu_info() -> None:
             print(f"[train] TensorFlow detected {len(gpus)} GPU(s):", flush=True)
             for g in gpus:
                 print(f"         {g}", flush=True)
-            # Enable memory growth to avoid allocating all VRAM upfront
+            # Memory growth: allocate VRAM on demand instead of claiming all 15 GB upfront.
+            # Required when mixed precision is enabled alongside PyBullet.
             for g in gpus:
                 try:
                     tf.config.experimental.set_memory_growth(g, True)
-                except Exception:
-                    pass
+                except RuntimeError:
+                    pass  # already initialised — must be set before any GPU ops
         else:
             print("[train] WARNING: No GPU detected by TensorFlow. Running on CPU.", flush=True)
-            print("        On Colab: Runtime → Change runtime type → GPU", flush=True)
+            print("        On Colab: Runtime → Change runtime type → T4 GPU", flush=True)
     except ImportError:
         print("[train] TensorFlow not found.", flush=True)
 
@@ -141,20 +145,34 @@ def _print_gpu_info() -> None:
 def train(args: argparse.Namespace) -> None:
     global _stop_requested
 
-    _print_gpu_info()
+    # GPU memory growth must be configured before any TF model is built
+    _setup_gpu()
 
     from environment import VisionControlEnv
     from agent import DQNAgent
 
+    train_freq      = _train_cfg["train_freq"]       # env steps between training rounds
+    gradient_steps  = _train_cfg["gradient_steps"]   # gradient updates per training round
+    mixed_precision = _train_cfg["mixed_precision"]  # FP16 on T4 tensor cores
+
+    print(
+        f"[train] Config: batch={cfg['dqn']['batch_size']}  "
+        f"train_freq={train_freq}  gradient_steps={gradient_steps}  "
+        f"mixed_precision={mixed_precision}",
+        flush=True,
+    )
+
     env = None
     try:
         print("[train] Initialising environment (headless / p.DIRECT)…", flush=True)
-        env = VisionControlEnv()  # always headless in this version
+        env = VisionControlEnv()
 
         agent = DQNAgent(
             n_actions=env.n_actions,
             obs_shape=env.observation_shape,
+            mixed_precision=mixed_precision,
         )
+        print("[train] tf.function Bellman graph will be compiled on first train step.", flush=True)
 
         # Resume from checkpoint if requested and available
         load_path = None
@@ -174,26 +192,32 @@ def train(args: argparse.Namespace) -> None:
             print("[train] Training from scratch.", flush=True)
 
         obs, _ = env.reset()
-        episode = 0
+        episode     = 0
+        global_step = 0       # total env steps across all episodes
         success_count = 0
-        ep_reward = 0.0
+        ep_reward   = 0.0
         ep_losses: List[float] = []
 
         # History for CSV + plot
-        history_ep: List[int] = []
-        history_reward: List[float] = []
+        history_ep:       List[int]   = []
+        history_reward:   List[float] = []
         history_avg_loss: List[float] = []
-        history_success: List[int] = []
-        history_epsilon: List[float] = []
+        history_success:  List[int]   = []
+        history_epsilon:  List[float] = []
 
-        # Periodic checkpoint every N episodes
         CHECKPOINT_EVERY = args.checkpoint_every
-        LOG_EVERY = args.log_every
-        max_episodes = args.episodes  # 0 = run until stopped
+        LOG_EVERY        = args.log_every
+        max_episodes     = args.episodes  # 0 = unlimited
+
+        # Steps/sec tracking
+        _perf_t0      = time.monotonic()
+        _perf_steps   = 0
+        PERF_INTERVAL = 200  # print throughput every N env steps
 
         print(
-            f"[train] Starting. max_episodes={'unlimited' if max_episodes == 0 else max_episodes} "
-            f"| checkpoint_every={CHECKPOINT_EVERY} | log_every={LOG_EVERY}",
+            f"[train] Starting. "
+            f"max_episodes={'unlimited' if max_episodes == 0 else max_episodes} | "
+            f"checkpoint_every={CHECKPOINT_EVERY} | log_every={LOG_EVERY}",
             flush=True,
         )
 
@@ -202,18 +226,29 @@ def train(args: argparse.Namespace) -> None:
                 print(f"[train] Reached {max_episodes} episodes.", flush=True)
                 break
 
+            # ── Environment step (CPU / PyBullet) ───────────────────────────
             action = agent.select_action(obs, training=True)
             next_obs, reward, done, truncated, info = env.step(action)
             ep_reward += reward
             agent.store(obs, action, reward, next_obs, done or truncated)
-            loss = agent.train_step()
-            if loss is not None:
-                ep_losses.append(loss)
             obs = next_obs
+            global_step += 1
+            _perf_steps += 1
 
             if info.get("success"):
                 success_count += 1
 
+            # ── GPU training round (every train_freq env steps) ─────────────
+            # Collecting train_freq steps first means the GPU gets gradient_steps
+            # updates with batch_size=256 each time, instead of one tiny batch
+            # per step. This dramatically reduces CPU↔GPU sync overhead.
+            if global_step % train_freq == 0:
+                for _ in range(gradient_steps):
+                    loss = agent.train_step()
+                    if loss is not None:
+                        ep_losses.append(loss)
+
+            # ── Episode end ─────────────────────────────────────────────────
             if done or truncated:
                 avg_loss = float(np.mean(ep_losses)) if ep_losses else 0.0
                 history_ep.append(episode)
@@ -235,23 +270,34 @@ def train(args: argparse.Namespace) -> None:
                 obs, _ = env.reset()
                 episode += 1
 
-                # Periodic checkpoint save
                 if CHECKPOINT_EVERY > 0 and episode % CHECKPOINT_EVERY == 0:
                     os.makedirs(MODELS_DIR, exist_ok=True)
                     agent.save(MODEL_PATH)
                     print(f"[train] Checkpoint saved → {MODEL_PATH}", flush=True)
+
+            # ── Throughput report ────────────────────────────────────────────
+            if _perf_steps >= PERF_INTERVAL:
+                elapsed = time.monotonic() - _perf_t0
+                sps = _perf_steps / elapsed if elapsed > 0 else 0.0
+                print(f"[train] {global_step:>8} env steps | {sps:>6.1f} steps/sec", flush=True)
+                _perf_t0    = time.monotonic()
+                _perf_steps = 0
 
         # ── Final save ───────────────────────────────────────────────────────
         os.makedirs(MODELS_DIR, exist_ok=True)
         agent.save(MODEL_PATH)
         print(f"[train] Model saved → {MODEL_PATH}", flush=True)
 
-        csv_path = _save_training_csv(
+        csv_path  = _save_training_csv(
             history_ep, history_reward, history_avg_loss, history_success, history_epsilon
         )
         plot_path = _plot_training_metrics(history_ep, history_reward, history_avg_loss)
 
-        print(f"[train] Done. Total episodes: {episode} | Total successes: {success_count}", flush=True)
+        print(
+            f"[train] Done. Total episodes: {episode} | "
+            f"Total env steps: {global_step} | Successes: {success_count}",
+            flush=True,
+        )
         if csv_path:
             print(f"[train] Metrics CSV → {csv_path}", flush=True)
         if plot_path:
