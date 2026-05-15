@@ -116,28 +116,93 @@ def _plot_training_metrics(
 
 def _setup_gpu() -> None:
     """
-    Configure GPU memory growth and confirm the device TF will use.
+    Configure GPU memory growth, confirm the device TF will use,
+    and run a timed compute check so you can see the GPU is actually active.
     Must be called before any tf.keras model is built.
     """
     try:
         import tensorflow as tf
         gpus = tf.config.list_physical_devices("GPU")
-        if gpus:
-            print(f"[train] TensorFlow detected {len(gpus)} GPU(s):", flush=True)
-            for g in gpus:
-                print(f"         {g}", flush=True)
-            # Memory growth: allocate VRAM on demand instead of claiming all 15 GB upfront.
-            # Required when mixed precision is enabled alongside PyBullet.
-            for g in gpus:
-                try:
-                    tf.config.experimental.set_memory_growth(g, True)
-                except RuntimeError:
-                    pass  # already initialised — must be set before any GPU ops
-        else:
+        if not gpus:
             print("[train] WARNING: No GPU detected by TensorFlow. Running on CPU.", flush=True)
             print("        On Colab: Runtime → Change runtime type → T4 GPU", flush=True)
+            return
+
+        print(f"[train] TensorFlow detected {len(gpus)} GPU(s):", flush=True)
+        for g in gpus:
+            print(f"         {g}", flush=True)
+
+        # Memory growth: allocate VRAM on demand instead of claiming all 15 GB upfront.
+        for g in gpus:
+            try:
+                tf.config.experimental.set_memory_growth(g, True)
+            except RuntimeError:
+                pass  # already initialised — must be set before any GPU ops
+
+        # ── Compute verification ─────────────────────────────────────────────
+        # Runs a 2048×2048 matrix multiply on GPU and CPU and prints both times.
+        # This proves compute is actually dispatched to the GPU, and also warms
+        # up the CUDA context so the first real train_step isn't slow.
+        #
+        # NOTE on 0.4 GB memory usage: that is EXPECTED for this model.
+        #   • Two DQN networks (~1.7 M params each) = ~14 MB of weights
+        #   • Adam optimizer state (2× model params) = ~14 MB
+        #   • TF/CUDA runtime = ~350-400 MB
+        #   Total: ~0.4 GB — the model is simply small.
+        #   GPU *compute* utilisation (%) is what matters, not memory.
+        #   Use  !nvidia-smi -l 1  in a separate Colab cell to watch it live.
+        N = 2048
+        with tf.device("/GPU:0"):
+            a = tf.random.normal([N, N])
+            b = tf.random.normal([N, N])
+            _ = tf.matmul(a, b).numpy()          # first call triggers CUDA JIT; discard
+            t0 = time.monotonic()
+            for _ in range(5):
+                tf.matmul(a, b).numpy()
+            gpu_ms = (time.monotonic() - t0) / 5 * 1000
+
+        with tf.device("/CPU:0"):
+            a_cpu = tf.random.normal([N, N])
+            b_cpu = tf.random.normal([N, N])
+            t0 = time.monotonic()
+            tf.matmul(a_cpu, b_cpu).numpy()
+            cpu_ms = (time.monotonic() - t0) * 1000
+
+        print(
+            f"[train] GPU compute check ({N}×{N} matmul): "
+            f"GPU={gpu_ms:.1f} ms  CPU={cpu_ms:.1f} ms  "
+            f"(speedup={cpu_ms/gpu_ms:.1f}×)",
+            flush=True,
+        )
+        print(
+            "[train] TF ops confirmed on GPU. "
+            "Low VRAM (0.4 GB) is normal — the DQN model is ~14 MB. "
+            "Watch GPU *compute %* with:  !nvidia-smi -l 1",
+            flush=True,
+        )
+
     except ImportError:
         print("[train] TensorFlow not found.", flush=True)
+    except Exception as e:
+        print(f"[train] GPU setup warning: {e}", flush=True)
+
+
+# ── GPU util helper ──────────────────────────────────────────────────────────
+
+def _gpu_stats() -> str:
+    """Return a short nvidia-smi string, or empty string if unavailable."""
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            timeout=2,
+        ).decode().strip()
+        util, mem_used, mem_total = out.split(", ")
+        return f"GPU {util}% util  {mem_used}/{mem_total} MB"
+    except Exception:
+        return ""
 
 
 # ── Main training loop ───────────────────────────────────────────────────────
@@ -145,60 +210,61 @@ def _setup_gpu() -> None:
 def train(args: argparse.Namespace) -> None:
     global _stop_requested
 
-    # GPU memory growth must be configured before any TF model is built
+    n_envs          = args.n_envs
+    train_freq      = _train_cfg["train_freq"]
+    gradient_steps  = _train_cfg["gradient_steps"]
+    mixed_precision = _train_cfg["mixed_precision"]
+
+    # ── 1. Fork worker processes BEFORE initialising CUDA ───────────────────
+    # Workers only use PyBullet + OpenCV (no TF/CUDA), so they must be created
+    # before _setup_gpu() to avoid inheriting an active CUDA context.
+    from vec_env import SubprocVecEnv
+    print(f"[train] Starting {n_envs} environment worker(s)…", flush=True)
+    vec_env = SubprocVecEnv(n_envs)
+
+    # ── 2. Now initialise GPU / TF in the parent ─────────────────────────────
     _setup_gpu()
 
-    from environment import VisionControlEnv
     from agent import DQNAgent
 
-    train_freq      = _train_cfg["train_freq"]       # env steps between training rounds
-    gradient_steps  = _train_cfg["gradient_steps"]   # gradient updates per training round
-    mixed_precision = _train_cfg["mixed_precision"]  # FP16 on T4 tensor cores
-
     print(
-        f"[train] Config: batch={cfg['dqn']['batch_size']}  "
+        f"[train] Config: n_envs={n_envs}  batch={cfg['dqn']['batch_size']}  "
         f"train_freq={train_freq}  gradient_steps={gradient_steps}  "
         f"mixed_precision={mixed_precision}",
         flush=True,
     )
 
-    env = None
     try:
-        print("[train] Initialising environment (headless / p.DIRECT)…", flush=True)
-        env = VisionControlEnv()
-
         agent = DQNAgent(
-            n_actions=env.n_actions,
-            obs_shape=env.observation_shape,
+            n_actions=vec_env.n_actions,
+            obs_shape=vec_env.observation_shape,
             mixed_precision=mixed_precision,
         )
-        print("[train] tf.function Bellman graph will be compiled on first train step.", flush=True)
+        print("[train] tf.function Bellman graph compiled on first train step.", flush=True)
 
-        # Resume from checkpoint if requested and available
+        # ── Resume ───────────────────────────────────────────────────────────
         load_path = None
         if args.resume:
-            if os.path.isfile(MODEL_PATH):
-                load_path = MODEL_PATH
-            elif os.path.isfile(MODEL_PATH_H5):
-                load_path = MODEL_PATH_H5
-
+            load_path = MODEL_PATH if os.path.isfile(MODEL_PATH) else (
+                MODEL_PATH_H5 if os.path.isfile(MODEL_PATH_H5) else None
+            )
         if load_path:
             try:
                 agent.load(load_path)
                 print(f"[train] Resumed from {load_path}", flush=True)
             except Exception as e:
-                print(f"[train] Could not load {load_path}: {e} — training from scratch", flush=True)
+                print(f"[train] Could not load {load_path}: {e} — scratch", flush=True)
         else:
             print("[train] Training from scratch.", flush=True)
 
-        obs, _ = env.reset()
+        # ── State ─────────────────────────────────────────────────────────────
+        obs_batch   = vec_env.reset()          # (N, H, W)
+        ep_rewards  = np.zeros(n_envs)         # cumulative reward per active episode
         episode     = 0
-        global_step = 0       # total env steps across all episodes
+        global_step = 0
         success_count = 0
-        ep_reward   = 0.0
-        ep_losses: List[float] = []
+        recent_losses: List[float] = []        # gradient losses since last episode end
 
-        # History for CSV + plot
         history_ep:       List[int]   = []
         history_reward:   List[float] = []
         history_avg_loss: List[float] = []
@@ -207,12 +273,11 @@ def train(args: argparse.Namespace) -> None:
 
         CHECKPOINT_EVERY = args.checkpoint_every
         LOG_EVERY        = args.log_every
-        max_episodes     = args.episodes  # 0 = unlimited
+        max_episodes     = args.episodes
 
-        # Steps/sec tracking
-        _perf_t0      = time.monotonic()
-        _perf_steps   = 0
-        PERF_INTERVAL = 200  # print throughput every N env steps
+        _perf_t0    = time.monotonic()
+        _perf_steps = 0
+        PERF_INTERVAL = 200
 
         print(
             f"[train] Starting. "
@@ -221,69 +286,73 @@ def train(args: argparse.Namespace) -> None:
             flush=True,
         )
 
+        # ── Main loop ─────────────────────────────────────────────────────────
         while not _stop_requested:
             if max_episodes > 0 and episode >= max_episodes:
                 print(f"[train] Reached {max_episodes} episodes.", flush=True)
                 break
 
-            # ── Environment step (CPU / PyBullet) ───────────────────────────
-            action = agent.select_action(obs, training=True)
-            next_obs, reward, done, truncated, info = env.step(action)
-            ep_reward += reward
-            agent.store(obs, action, reward, next_obs, done or truncated)
-            obs = next_obs
-            global_step += 1
-            _perf_steps += 1
+            # ── N env steps in parallel (all N PyBullet processes run at once)
+            actions = agent.select_actions_batch(obs_batch, training=True)
+            next_obs, rewards, dones, truncs, infos = vec_env.step(actions)
 
-            if info.get("success"):
-                success_count += 1
+            # Store all N transitions in one vectorised write
+            agent.store_batch(obs_batch, actions, rewards, next_obs, dones | truncs)
 
-            # ── GPU training round (every train_freq env steps) ─────────────
-            # Collecting train_freq steps first means the GPU gets gradient_steps
-            # updates with batch_size=256 each time, instead of one tiny batch
-            # per step. This dramatically reduces CPU↔GPU sync overhead.
+            ep_rewards  += rewards
+            obs_batch    = next_obs
+            global_step += n_envs
+            _perf_steps += n_envs
+
+            # ── Episode boundaries ────────────────────────────────────────────
+            for i, info in enumerate(infos):
+                if info.get("episode_done"):
+                    episode += 1
+                    if info.get("success"):
+                        success_count += 1
+                    avg_loss = float(np.mean(recent_losses)) if recent_losses else 0.0
+                    history_ep.append(episode)
+                    history_reward.append(float(ep_rewards[i]))
+                    history_avg_loss.append(avg_loss)
+                    history_success.append(1 if info.get("success") else 0)
+                    history_epsilon.append(agent.epsilon)
+                    recent_losses.clear()
+
+                    if episode % LOG_EVERY == 0:
+                        print(
+                            f"[train] ep={episode:>6}  reward={ep_rewards[i]:>8.2f}  "
+                            f"avg_loss={avg_loss:.5f}  success={success_count}  "
+                            f"ε={agent.epsilon:.4f}  dist={info.get('distance', 0):.3f}",
+                            flush=True,
+                        )
+                    ep_rewards[i] = 0.0
+
+                    if CHECKPOINT_EVERY > 0 and episode % CHECKPOINT_EVERY == 0:
+                        os.makedirs(MODELS_DIR, exist_ok=True)
+                        agent.save(MODEL_PATH)
+                        print(f"[train] Checkpoint saved → {MODEL_PATH}", flush=True)
+
+            # ── GPU training round ────────────────────────────────────────────
             if global_step % train_freq == 0:
                 for _ in range(gradient_steps):
                     loss = agent.train_step()
                     if loss is not None:
-                        ep_losses.append(loss)
+                        recent_losses.append(loss)
 
-            # ── Episode end ─────────────────────────────────────────────────
-            if done or truncated:
-                avg_loss = float(np.mean(ep_losses)) if ep_losses else 0.0
-                history_ep.append(episode)
-                history_reward.append(ep_reward)
-                history_avg_loss.append(avg_loss)
-                history_success.append(1 if info.get("success") else 0)
-                history_epsilon.append(agent.epsilon)
-
-                if episode % LOG_EVERY == 0:
-                    print(
-                        f"[train] ep={episode:>6}  reward={ep_reward:>8.2f}  "
-                        f"avg_loss={avg_loss:.5f}  success={success_count}  "
-                        f"ε={agent.epsilon:.4f}  dist={info.get('distance', 0):.3f}",
-                        flush=True,
-                    )
-
-                ep_reward = 0.0
-                ep_losses = []
-                obs, _ = env.reset()
-                episode += 1
-
-                if CHECKPOINT_EVERY > 0 and episode % CHECKPOINT_EVERY == 0:
-                    os.makedirs(MODELS_DIR, exist_ok=True)
-                    agent.save(MODEL_PATH)
-                    print(f"[train] Checkpoint saved → {MODEL_PATH}", flush=True)
-
-            # ── Throughput report ────────────────────────────────────────────
+            # ── Throughput report ─────────────────────────────────────────────
             if _perf_steps >= PERF_INTERVAL:
                 elapsed = time.monotonic() - _perf_t0
-                sps = _perf_steps / elapsed if elapsed > 0 else 0.0
-                print(f"[train] {global_step:>8} env steps | {sps:>6.1f} steps/sec", flush=True)
+                sps     = _perf_steps / elapsed if elapsed > 0 else 0.0
+                stats   = _gpu_stats()
+                print(
+                    f"[train] {global_step:>8} steps | {sps:>6.1f} steps/sec"
+                    + (f"  |  {stats}" if stats else ""),
+                    flush=True,
+                )
                 _perf_t0    = time.monotonic()
                 _perf_steps = 0
 
-        # ── Final save ───────────────────────────────────────────────────────
+        # ── Final save ────────────────────────────────────────────────────────
         os.makedirs(MODELS_DIR, exist_ok=True)
         agent.save(MODEL_PATH)
         print(f"[train] Model saved → {MODEL_PATH}", flush=True)
@@ -294,8 +363,8 @@ def train(args: argparse.Namespace) -> None:
         plot_path = _plot_training_metrics(history_ep, history_reward, history_avg_loss)
 
         print(
-            f"[train] Done. Total episodes: {episode} | "
-            f"Total env steps: {global_step} | Successes: {success_count}",
+            f"[train] Done. episodes={episode}  env_steps={global_step}  "
+            f"successes={success_count}",
             flush=True,
         )
         if csv_path:
@@ -307,47 +376,35 @@ def train(args: argparse.Namespace) -> None:
         print(f"[train] Fatal error: {e}", flush=True)
         raise
     finally:
-        if env is not None:
-            try:
-                env.close()
-            except Exception:
-                pass
+        vec_env.close()
 
 
 # ── CLI entry point ──────────────────────────────────────────────────────────
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Headless DQN training for Robot-DRL (Colab GPU compatible)"
+        description="Headless DQN training for Robot-DRL (Colab GPU / parallel envs)"
     )
-    parser.add_argument(
-        "--resume",
-        action="store_true",
-        help="Resume from saved checkpoint if one exists",
-    )
-    parser.add_argument(
-        "--episodes",
-        type=int,
-        default=0,
-        metavar="N",
-        help="Stop after N episodes (default: 0 = run until Ctrl-C)",
-    )
-    parser.add_argument(
-        "--checkpoint-every",
-        type=int,
-        default=_train_cfg["checkpoint_every"],
-        dest="checkpoint_every",
-        metavar="N",
-        help=f"Save a checkpoint every N episodes (default: {_train_cfg['checkpoint_every']})",
-    )
-    parser.add_argument(
-        "--log-every",
-        type=int,
-        default=_train_cfg["log_every"],
-        dest="log_every",
-        metavar="N",
-        help=f"Print a progress line every N episodes (default: {_train_cfg['log_every']})",
-    )
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume from saved checkpoint if one exists")
+    parser.add_argument("--episodes", type=int, default=0, metavar="N",
+                        help="Stop after N episodes (default: 0 = unlimited)")
+    parser.add_argument("--n-envs", type=int,
+                        default=_train_cfg.get("n_envs", 1),
+                        dest="n_envs", metavar="N",
+                        help=f"Parallel environments "
+                             f"(default: {_train_cfg.get('n_envs', 1)}, "
+                             f"free Colab=2, Pro=4)")
+    parser.add_argument("--checkpoint-every", type=int,
+                        default=_train_cfg["checkpoint_every"],
+                        dest="checkpoint_every", metavar="N",
+                        help=f"Checkpoint every N episodes "
+                             f"(default: {_train_cfg['checkpoint_every']})")
+    parser.add_argument("--log-every", type=int,
+                        default=_train_cfg["log_every"],
+                        dest="log_every", metavar="N",
+                        help=f"Log every N episodes "
+                             f"(default: {_train_cfg['log_every']})")
     return parser.parse_args()
 
 

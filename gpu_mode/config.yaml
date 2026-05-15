@@ -67,3 +67,4 @@ training:
   train_freq: 4            # collect this many env steps before each training round
   gradient_steps: 2        # gradient updates per training round
   mixed_precision: true    # FP16 on T4 tensor cores: 65 TFLOPS vs 8.1 TFLOPS FP32
+  n_envs: 4                # parallel PyBullet subprocesses (2 = free Colab, 4+ = Pro)

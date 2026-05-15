@@ -190,14 +190,34 @@ class DQNAgent:
         return obs.astype(np.float32)
 
     def select_action(self, obs: np.ndarray, training: bool = True) -> int:
-        """Epsilon-greedy action selection."""
+        """Epsilon-greedy action selection for a single observation."""
         if training and np.random.random() < self.epsilon:
             return int(np.random.randint(0, self.n_actions))
         q = self.model(self._obs_to_batch(obs), training=False)
         return int(np.argmax(q[0].numpy()))
 
+    def select_actions_batch(self, obs_batch: np.ndarray, training: bool = True) -> np.ndarray:
+        """
+        Epsilon-greedy for N observations in one GPU forward pass.
+
+        obs_batch: (N, H, W) float32
+        Returns:   (N,) int32 actions
+
+        One model call for all N envs instead of N separate calls —
+        this is the key efficiency gain when using SubprocVecEnv.
+        """
+        N = obs_batch.shape[0]
+        obs_4d = obs_batch[:, :, :, np.newaxis].astype(np.float32)  # (N, H, W, 1)
+        q_values = self.model(obs_4d, training=False).numpy()        # (N, n_actions)
+        greedy = np.argmax(q_values, axis=1)                         # (N,)
+        if training:
+            explore = np.random.random(N) < self.epsilon
+            random  = np.random.randint(0, self.n_actions, size=N)
+            return np.where(explore, random, greedy).astype(np.int32)
+        return greedy.astype(np.int32)
+
     def store(self, s: np.ndarray, a: int, r: float, s2: np.ndarray, done: bool) -> None:
-        """Add transition to replay buffer (circular)."""
+        """Add a single transition to the replay buffer (circular)."""
         pos = self._buffer_pos % self._buffer_size
         self._buffer_s[pos] = self._obs_to_batch(s)[0]
         self._buffer_a[pos] = a
@@ -206,6 +226,29 @@ class DQNAgent:
         self._buffer_done[pos] = 1.0 if done else 0.0
         self._buffer_pos += 1
         self._buffer_len = min(self._buffer_len + 1, self._buffer_size)
+
+    def store_batch(
+        self,
+        s_batch:    np.ndarray,  # (N, H, W)
+        a_batch:    np.ndarray,  # (N,) int
+        r_batch:    np.ndarray,  # (N,) float
+        s2_batch:   np.ndarray,  # (N, H, W)
+        done_batch: np.ndarray,  # (N,) bool
+    ) -> None:
+        """
+        Store N transitions at once using vectorised numpy indexing.
+        Faster than calling store() in a loop because there are no
+        per-element Python calls.
+        """
+        N = len(a_batch)
+        pos = np.arange(self._buffer_pos, self._buffer_pos + N) % self._buffer_size
+        self._buffer_s[pos]    = s_batch[:, :, :, np.newaxis].astype(np.float32)
+        self._buffer_a[pos]    = a_batch.astype(np.int32)
+        self._buffer_r[pos]    = r_batch.astype(np.float32)
+        self._buffer_s2[pos]   = s2_batch[:, :, :, np.newaxis].astype(np.float32)
+        self._buffer_done[pos] = done_batch.astype(np.float32)
+        self._buffer_pos += N
+        self._buffer_len = min(self._buffer_len + N, self._buffer_size)
 
     def train_step(self) -> Optional[float]:
         """
