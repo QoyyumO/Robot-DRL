@@ -72,9 +72,11 @@ class DQNAgent:
     target forward pass, current forward pass, and backprop as a single
     compiled GPU kernel sequence — no Python round-trips between them.
 
-    Mixed precision (FP16) is supported for T4 / Ampere tensor cores.
-    Set mixed_precision=True (or via config.yaml training.mixed_precision)
-    to enable it. Activations are computed in FP16; weights stay in FP32.
+    Mixed precision (FP16): when mixed_precision=True the global Keras policy
+    is set to mixed_float16 before the models are built. Conv/Dense activations
+    are then computed in FP16 (T4 tensor cores); weights remain in FP32.
+    The Bellman loss and gradients are kept in float32 so no loss scaling is
+    needed — the plain Adam optimizer works correctly in both modes.
     """
 
     def __init__(
@@ -168,17 +170,11 @@ class DQNAgent:
         with tf.GradientTape() as tape:
             q_pred = self.model(s, training=True)               # (B, n_actions)
             q_taken = tf.cast(tf.gather_nd(q_pred, indices), tf.float32)  # (B,)
+            # Loss in float32 — safe even with mixed_float16 policy because
+            # both operands are explicitly cast above. No loss scaling needed.
             loss = tf.reduce_mean(tf.square(bellman_target - q_taken))
-            if self._mixed_precision:
-                # LossScaleOptimizer scales the loss to prevent FP16 underflow
-                scaled_loss = self._optimizer.get_scaled_loss(loss)
 
-        if self._mixed_precision:
-            grads = tape.gradient(scaled_loss, self.model.trainable_variables)
-            grads = self._optimizer.get_unscaled_gradients(grads)
-        else:
-            grads = tape.gradient(loss, self.model.trainable_variables)
-
+        grads = tape.gradient(loss, self.model.trainable_variables)
         self._optimizer.apply_gradients(zip(grads, self.model.trainable_variables))
         return loss
 
