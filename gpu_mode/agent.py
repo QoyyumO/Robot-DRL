@@ -112,13 +112,11 @@ class DQNAgent:
         self.target_model = build_dqn_model(n_actions, obs_shape[0], obs_shape[1])
         self._sync_target()
 
-        # Optimizer lives here, not inside model.compile — gives us direct
-        # control for mixed precision loss scaling and the custom Bellman step.
-        base_opt = tf.keras.optimizers.Adam(learning_rate=learning_rate)
-        if mixed_precision:
-            self._optimizer = tf.keras.mixed_precision.LossScaleOptimizer(base_opt)
-        else:
-            self._optimizer = base_opt
+        # Plain Adam — no LossScaleOptimizer needed.
+        # The Bellman loss and gradients are computed in float32 (we cast
+        # q_taken and bellman_target before the MSE), so there is no FP16
+        # underflow risk regardless of the mixed_precision setting.
+        self._optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
 
         # Compile the Bellman update as a TF graph once after everything is built.
         # tf.function traces on first call and reuses the compiled graph from then on.
