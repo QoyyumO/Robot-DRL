@@ -51,7 +51,7 @@ class VisionControlEnv:
         time_step: float = _env_cfg["physics_time_step"],
         target_mode: str = "random",
         preset_targets: Optional[Sequence[Tuple[float, float, float]]] = None,
-        enable_early_truncation: bool = True,
+        enable_early_truncation: Optional[bool] = None,
     ):
         if not HAS_PYBULLET:
             raise RuntimeError("PyBullet is required. Install with: pip install pybullet")
@@ -70,13 +70,24 @@ class VisionControlEnv:
         self._step_count = 0
         self._max_steps: int = _env_cfg["max_steps_per_episode"]
         self._prev_distance: float = 0.0
+        self._initial_distance: float = 1.0
         self._last_3_rewards: list = []
+        self._reward_mode: str = _rew_cfg.get("mode", "sign_step")
+        self._progress_clip: float = float(_rew_cfg.get("progress_clip", 1.0))
+        self._reward_scale: float = float(_rew_cfg.get("reward_scale", 1.0))
         self._target_pos_3d: Optional[Tuple[float, float, float]] = None
         self._target_mode = target_mode
         self._preset_targets = list(preset_targets) if preset_targets else []
         self._preset_target_idx = 0
+        if enable_early_truncation is None:
+            enable_early_truncation = bool(_rew_cfg.get("use_early_truncation", True))
         self._enable_early_truncation = enable_early_truncation
-        self._early_truncation_threshold: int = _env_cfg["early_truncation_threshold"]
+        self._early_truncation_threshold: float = float(
+            _rew_cfg.get(
+                "early_truncation_sum_threshold",
+                _env_cfg.get("early_truncation_threshold", -1),
+            )
+        )
         if self._target_mode not in ("random", "preset_cycle"):
             raise ValueError("target_mode must be 'random' or 'preset_cycle'")
         if self._target_mode == "preset_cycle" and not self._preset_targets:
@@ -169,15 +180,30 @@ class VisionControlEnv:
         self._step_count = 0
         self._last_3_rewards = []
         self._prev_distance = self._distance_ee_to_target()
+        self._initial_distance = max(self._prev_distance, 1e-3)
 
         obs = self._get_dqn_obs()
         return obs, {
             "target_pos": self._target_pos_3d,
             "ee_pos": self._get_end_effector_pos(),
+            "distance": self._prev_distance,
         }
 
+    def _compute_step_reward(self, dist: float) -> float:
+        """Per-step reward before success bonus and scaling."""
+        if self._reward_mode == "normalized_progress":
+            progress = self._prev_distance - dist
+            scale = max(self._initial_distance, 1e-3)
+            return float(np.clip(progress / scale, -self._progress_clip, self._progress_clip))
+        dis_change = dist - self._prev_distance
+        if dis_change > 0:
+            return float(_rew_cfg["farther"])
+        if dis_change < 0:
+            return float(_rew_cfg["closer"])
+        return float(_rew_cfg["same"])
+
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, dict]:
-        """Step simulation. Reward: +1 closer, -1 farther."""
+        """Step simulation. Reward from config (default: normalized distance progress)."""
         if self._client_id is None or self._arm_id is None:
             raise RuntimeError("Call reset() first.")
 
@@ -223,24 +249,22 @@ class VisionControlEnv:
         )
 
         dist = self._distance_ee_to_target()
-        dis_change = dist - self._prev_distance
-        if dis_change > 0:
-            reward = _rew_cfg["farther"]
-        elif dis_change < 0:
-            reward = _rew_cfg["closer"]
-        else:
-            reward = _rew_cfg["same"]
+        reward = self._compute_step_reward(dist)
         self._prev_distance = dist
         self._last_3_rewards.append(reward)
         if len(self._last_3_rewards) > 3:
             self._last_3_rewards.pop(0)
 
-        sum_last_3 = sum(self._last_3_rewards) if len(self._last_3_rewards) >= 3 else 0
+        sum_last_3 = sum(self._last_3_rewards) if len(self._last_3_rewards) >= 3 else 0.0
         done = self._step_count >= self._max_steps or dist < COMPLETION_RADIUS
-        truncated = (sum_last_3 < self._early_truncation_threshold) if self._enable_early_truncation else False
+        truncated = (
+            sum_last_3 < self._early_truncation_threshold
+        ) if self._enable_early_truncation else False
         success = dist < COMPLETION_RADIUS
         if success:
-            reward += _rew_cfg["success_bonus"]
+            reward += float(_rew_cfg.get("success_bonus", 1.0))
+        if self._reward_scale != 1.0:
+            reward *= self._reward_scale
 
         obs = self._get_dqn_obs()
         return obs, reward, done, truncated, {
