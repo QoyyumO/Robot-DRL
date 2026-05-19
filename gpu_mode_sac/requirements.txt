@@ -1,0 +1,9 @@
+# Requirements for gpu_mode_sac (Google Colab GPU / headless SAC training)
+# Install: pip install -r gpu_mode_sac/requirements.txt
+
+opencv-python-headless>=4.5.0
+numpy>=1.19.0
+pybullet>=3.2.0
+tensorflow>=2.8.0
+matplotlib>=3.5.0
+pyyaml>=6.0

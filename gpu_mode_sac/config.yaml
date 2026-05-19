@@ -1,0 +1,67 @@
+# ============================================================
+# Vision-Based Robotic Arm Control — SAC GPU/Headless Config
+# Algorithm: Soft Actor-Critic (Haarnoja et al., 2018) — discrete actions
+# ============================================================
+
+sac:
+  learning_rate: 3.0e-4
+  gamma: 0.99
+  tau: 0.005                 # soft target network update coefficient
+  alpha: 0.2                 # entropy temperature (fixed)
+  buffer_size: 100000
+  batch_size: 256
+  train_freq: 4
+  gradient_steps: 2
+  target_entropy: null       # null = -log(n_actions); set a float to override
+
+network:
+  dense_units: 512
+  conv_filters: [32, 64, 64]
+  conv_kernels: [8, 4, 3]
+  conv_strides: [4, 2, 1]
+
+environment:
+  camera_width: 320
+  camera_height: 240
+  physics_time_step: 0.016667
+  gravity: -10.0
+  max_steps_per_episode: 500
+  joint_delta: 0.03
+  joint_force: 100
+  completion_radius: 0.08
+  early_truncation_threshold: -1
+  camera_distance: 1.5
+  camera_yaw: 60
+  camera_pitch: -30
+  camera_target: [0.5, 0.0, 0.08]
+  camera_fov: 60
+  target_x_min: 0.25
+  target_x_max: 0.85
+  target_y_min: -0.35
+  target_y_max: 0.35
+  target_z_min: 0.05
+  target_z_range: 0.08
+
+rewards:
+  mode: normalized_progress
+  progress_clip: 1.0
+  success_bonus: 1.0
+  reward_scale: 1.0
+  use_early_truncation: false
+  early_truncation_sum_threshold: -2.0
+  closer: 1.0
+  farther: -1.0
+  same: 0.0
+
+preprocessing:
+  width: 84
+  height: 84
+  bilateral_d: 9
+  bilateral_sigma_color: 75.0
+  bilateral_sigma_space: 75.0
+
+training:
+  checkpoint_every: 100
+  log_every: 10
+  mixed_precision: true
+  n_envs: 4
