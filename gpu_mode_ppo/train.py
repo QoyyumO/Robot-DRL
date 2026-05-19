@@ -30,7 +30,7 @@ _ppo_cfg = cfg["ppo"]
 
 LOGS_DIR = os.path.join(_ROOT, "logs")
 MODELS_DIR = os.path.join(_ROOT, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "ppo_model.keras")
+MODEL_PATH = os.path.join(MODELS_DIR, "ppo_model")
 
 _stop_requested = False
 
@@ -148,10 +148,15 @@ def train(args: argparse.Namespace) -> None:
             mixed_precision=mixed_precision,
         )
 
-        if args.resume and os.path.isfile(MODEL_PATH):
+        resume_path = (
+            MODEL_PATH if os.path.isfile(MODEL_PATH)
+            else f"{MODEL_PATH}.keras" if os.path.isfile(f"{MODEL_PATH}.keras")
+            else None
+        )
+        if args.resume and resume_path:
             try:
-                agent.load(MODEL_PATH)
-                print(f"[train] Resumed from {MODEL_PATH}", flush=True)
+                agent.load(resume_path)
+                print(f"[train] Resumed from {resume_path}", flush=True)
             except Exception as e:
                 print(f"[train] Could not load checkpoint: {e} — scratch", flush=True)
         else:

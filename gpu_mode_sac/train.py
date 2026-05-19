@@ -30,7 +30,7 @@ _sac_cfg = cfg["sac"]
 
 LOGS_DIR = os.path.join(_ROOT, "logs")
 MODELS_DIR = os.path.join(_ROOT, "models")
-MODEL_PATH = os.path.join(MODELS_DIR, "sac_model.keras")
+MODEL_PATH = os.path.join(MODELS_DIR, "sac_model")
 
 _stop_requested = False
 
@@ -165,8 +165,8 @@ def train(args: argparse.Namespace) -> None:
             mixed_precision=mixed_precision,
         )
 
-        q1_path = MODEL_PATH.replace(".keras", "_q1.keras")
-        if args.resume and os.path.isfile(q1_path):
+        q1_path = f"{MODEL_PATH}_q1.keras"
+        if args.resume and (os.path.isfile(q1_path) or os.path.isfile(f"{MODEL_PATH}_q1")):
             try:
                 agent.load(MODEL_PATH)
                 print(f"[train] Resumed from {MODEL_PATH}", flush=True)

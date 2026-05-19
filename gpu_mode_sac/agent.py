@@ -129,17 +129,13 @@ class SACAgent:
             obs = obs[np.newaxis]
         return obs.astype(np.float32)
 
-    def _policy_dist(self, obs: "tf.Tensor", training: bool) -> "tf.keras.distributions.Categorical":
-        logits = tf.cast(self.policy(obs, training=training), tf.float32)
-        return tf.keras.distributions.Categorical(logits=logits)
-
     def select_actions_batch(self, obs_batch: np.ndarray, training: bool = True) -> np.ndarray:
         obs_4d = obs_batch[:, :, :, np.newaxis].astype(np.float32)
-        dist = self._policy_dist(tf.constant(obs_4d), training=False)
+        logits = tf.cast(self.policy(tf.constant(obs_4d), training=False), tf.float32)
         if training:
-            actions = dist.sample()
+            actions = tf.random.categorical(logits, 1, dtype=tf.int32)[:, 0]
         else:
-            actions = tf.argmax(dist.logits, axis=-1, output_type=tf.int32)
+            actions = tf.argmax(logits, axis=-1, output_type=tf.int32)
         return actions.numpy().astype(np.int32)
 
     def store_batch(
@@ -231,21 +227,30 @@ class SACAgent:
         loss = self._compiled_train(s, a, r, s2, done)
         return float(loss.numpy())
 
+    @staticmethod
+    def _component_path(base: str, suffix: str) -> str:
+        stem = f"{base}_{suffix}"
+        if os.path.isfile(stem):
+            return stem
+        keras_path = f"{stem}.keras"
+        if os.path.isfile(keras_path):
+            return keras_path
+        return keras_path
+
     def save(self, path: str) -> None:
-        stem = path[:-6] if path.endswith(".keras") else path
-        self.q1.save(f"{stem}_q1.keras")
-        self.q2.save(f"{stem}_q2.keras")
-        self.policy.save(f"{stem}_policy.keras")
+        base = path[:-6] if path.endswith(".keras") else path
+        self.q1.save(f"{base}_q1.keras")
+        self.q2.save(f"{base}_q2.keras")
+        self.policy.save(f"{base}_policy.keras")
 
     def load(self, path: str) -> None:
-        stem = path[:-6] if path.endswith(".keras") else path
-        base = stem
+        base = path[:-6] if path.endswith(".keras") else path
         self.q1 = build_q_network(self.n_actions, self.obs_shape[0], self.obs_shape[1])
         self.q2 = build_q_network(self.n_actions, self.obs_shape[0], self.obs_shape[1])
         self.policy = build_policy_network(self.n_actions, self.obs_shape[0], self.obs_shape[1])
-        self.q1.load_weights(f"{base}_q1.keras")
-        self.q2.load_weights(f"{base}_q2.keras")
-        self.policy.load_weights(f"{base}_policy.keras")
+        self.q1.load_weights(self._component_path(base, "q1"))
+        self.q2.load_weights(self._component_path(base, "q2"))
+        self.policy.load_weights(self._component_path(base, "policy"))
         self.q1_target = build_q_network(self.n_actions, self.obs_shape[0], self.obs_shape[1])
         self.q2_target = build_q_network(self.n_actions, self.obs_shape[0], self.obs_shape[1])
         self._sync_targets()

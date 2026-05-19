@@ -42,6 +42,20 @@ def _cnn_backbone(inputs: "tf.Tensor") -> "tf.Tensor":
     return tf.keras.layers.Dense(512, activation="relu")(x)
 
 
+def _log_prob_of_action(logits: "tf.Tensor", actions: "tf.Tensor") -> "tf.Tensor":
+    """Log pi(a|s) for chosen actions; works without tf.keras.distributions."""
+    log_probs = tf.nn.log_softmax(logits)
+    actions = tf.cast(actions, tf.int32)
+    idx = tf.stack([tf.range(tf.shape(actions)[0]), actions], axis=1)
+    return tf.gather_nd(log_probs, idx)
+
+
+def _categorical_entropy(logits: "tf.Tensor") -> "tf.Tensor":
+    log_probs = tf.nn.log_softmax(logits)
+    probs = tf.nn.softmax(logits)
+    return -tf.reduce_sum(probs * log_probs, axis=-1)
+
+
 def build_actor_critic(
     n_actions: int,
     input_h: int = OBS_H,
@@ -102,12 +116,11 @@ class PPOAgent:
             obs = obs[:, :, :, np.newaxis]
         return obs.astype(np.float32)
 
-    def _forward(self, obs_4d: "tf.Tensor") -> Tuple["tf.Tensor", "tf.Tensor", "tf.Tensor"]:
+    def _forward(self, obs_4d: "tf.Tensor") -> Tuple["tf.Tensor", "tf.Tensor"]:
         logits, value = self.model(obs_4d, training=False)
         logits = tf.cast(logits, tf.float32)
         value = tf.cast(tf.squeeze(value, axis=-1), tf.float32)
-        dist = tf.keras.distributions.Categorical(logits=logits)
-        return dist, value, logits
+        return logits, value
 
     def act_batch(
         self, obs_batch: np.ndarray, training: bool = True
@@ -117,12 +130,12 @@ class PPOAgent:
         Returns: actions (N,), log_probs (N,), values (N,)
         """
         obs_4d = tf.constant(self._obs_batch_4d(obs_batch))
-        dist, values, _ = self._forward(obs_4d)
+        logits, values = self._forward(obs_4d)
         if training:
-            actions = dist.sample()
+            actions = tf.random.categorical(logits, 1, dtype=tf.int32)[:, 0]
         else:
-            actions = tf.argmax(dist.logits, axis=-1, output_type=tf.int32)
-        log_probs = dist.log_prob(actions)
+            actions = tf.argmax(logits, axis=-1, output_type=tf.int32)
+        log_probs = _log_prob_of_action(logits, actions)
         return (
             actions.numpy().astype(np.int32),
             log_probs.numpy().astype(np.float32),
@@ -135,9 +148,9 @@ class PPOAgent:
         """Log-probs, values, entropy for stored (obs, action) pairs."""
         obs_4d = tf.constant(self._obs_batch_4d(obs))
         actions_t = tf.constant(actions.astype(np.int32))
-        dist, values, _ = self._forward(obs_4d)
-        log_probs = dist.log_prob(actions_t)
-        entropy = dist.entropy()
+        logits, values = self._forward(obs_4d)
+        log_probs = _log_prob_of_action(logits, actions_t)
+        entropy = _categorical_entropy(logits)
         return (
             log_probs.numpy().astype(np.float32),
             values.numpy().astype(np.float32),
@@ -181,9 +194,8 @@ class PPOAgent:
             logits, values = self.model(obs, training=True)
             logits = tf.cast(logits, tf.float32)
             values = tf.cast(tf.squeeze(values, axis=-1), tf.float32)
-            dist = tf.keras.distributions.Categorical(logits=logits)
-            log_probs = dist.log_prob(actions)
-            entropy = dist.entropy()
+            log_probs = _log_prob_of_action(logits, actions)
+            entropy = _categorical_entropy(logits)
 
             adv = tf.cast(advantages, tf.float32)
             adv = (adv - tf.reduce_mean(adv)) / (tf.math.reduce_std(adv) + 1e-8)
@@ -246,12 +258,23 @@ class PPOAgent:
             return {}
         return {k: v / n_updates for k, v in metrics_sum.items()}
 
+    @staticmethod
+    def _resolve_path(path: str) -> str:
+        if os.path.isfile(path):
+            return path
+        keras_path = f"{path}.keras"
+        if os.path.isfile(keras_path):
+            return keras_path
+        return keras_path
+
     def save(self, path: str) -> None:
-        self.model.save(path)
+        save_to = path if path.endswith(".keras") else f"{path}.keras"
+        self.model.save(save_to)
 
     def load(self, path: str) -> None:
         self.model = build_actor_critic(self.n_actions, self.obs_shape[0], self.obs_shape[1])
-        if path.endswith(".keras"):
-            self.model.load_weights(path)
+        weights_path = self._resolve_path(path)
+        if weights_path.endswith(".keras"):
+            self.model.load_weights(weights_path)
         else:
-            self.model.load_weights(path, by_name=False, skip_mismatch=False)
+            self.model.load_weights(weights_path, by_name=False, skip_mismatch=False)
