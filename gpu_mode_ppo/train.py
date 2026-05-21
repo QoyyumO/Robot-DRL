@@ -109,15 +109,60 @@ def _setup_gpu() -> None:
         gpus = tf.config.list_physical_devices("GPU")
         if not gpus:
             print("[train] WARNING: No GPU detected. Running on CPU.", flush=True)
+            print("        On Colab: Runtime → Change runtime type → T4 GPU", flush=True)
             return
-        print(f"[train] TensorFlow detected {len(gpus)} GPU(s).", flush=True)
+        print(f"[train] TensorFlow detected {len(gpus)} GPU(s):", flush=True)
+        for g in gpus:
+            print(f"         {g}", flush=True)
         for g in gpus:
             try:
                 tf.config.experimental.set_memory_growth(g, True)
             except RuntimeError:
                 pass
+        N = 2048
+        with tf.device("/GPU:0"):
+            a = tf.random.normal([N, N])
+            b = tf.random.normal([N, N])
+            _ = tf.matmul(a, b).numpy()
+            t0 = time.monotonic()
+            for _ in range(5):
+                tf.matmul(a, b).numpy()
+            gpu_ms = (time.monotonic() - t0) / 5 * 1000
+        with tf.device("/CPU:0"):
+            a_cpu = tf.random.normal([N, N])
+            b_cpu = tf.random.normal([N, N])
+            t0 = time.monotonic()
+            tf.matmul(a_cpu, b_cpu).numpy()
+            cpu_ms = (time.monotonic() - t0) * 1000
+        print(
+            f"[train] GPU compute check ({N}×{N} matmul): "
+            f"GPU={gpu_ms:.1f} ms  CPU={cpu_ms:.1f} ms  "
+            f"(speedup={cpu_ms / max(gpu_ms, 1e-6):.1f}×)",
+            flush=True,
+        )
     except ImportError:
         print("[train] TensorFlow not found.", flush=True)
+    except Exception as e:
+        print(f"[train] GPU setup warning: {e}", flush=True)
+
+
+def _gpu_stats() -> str:
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ["nvidia-smi",
+             "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            timeout=2,
+        ).decode().strip()
+        util, mem_used, mem_total = out.split(", ")
+        return f"GPU {util}% util  {mem_used}/{mem_total} MB"
+    except Exception:
+        return ""
+
+
+def _checkpoint_path() -> str:
+    return f"{MODEL_PATH}.keras"
 
 
 def train(args: argparse.Namespace) -> None:
@@ -177,10 +222,16 @@ def train(args: argparse.Namespace) -> None:
         CHECKPOINT_EVERY = args.checkpoint_every
         LOG_EVERY = args.log_every
         max_episodes = args.episodes
+        last_entropy = 0.0
+
+        _perf_t0 = time.monotonic()
+        _perf_steps = 0
+        PERF_INTERVAL = 200
 
         print(
-            f"[train] Starting PPO. max_episodes="
-            f"{'unlimited' if max_episodes == 0 else max_episodes}",
+            f"[train] Starting. "
+            f"max_episodes={'unlimited' if max_episodes == 0 else max_episodes} | "
+            f"checkpoint_every={CHECKPOINT_EVERY} | log_every={LOG_EVERY}",
             flush=True,
         )
 
@@ -211,6 +262,7 @@ def train(args: argparse.Namespace) -> None:
                 ep_rewards += rewards
                 obs_batch = next_obs
                 global_step += n_envs
+                _perf_steps += n_envs
 
                 for i, info in enumerate(infos):
                     if info.get("episode_done"):
@@ -222,13 +274,12 @@ def train(args: argparse.Namespace) -> None:
                         history_reward.append(float(ep_rewards[i]))
                         history_avg_loss.append(avg_loss)
                         history_success.append(1 if info.get("success") else 0)
-                        recent_losses.clear()
 
                         if episode % LOG_EVERY == 0:
                             print(
                                 f"[train] ep={episode:>6}  reward={ep_rewards[i]:>8.2f}  "
                                 f"avg_loss={avg_loss:.5f}  success={success_count}  "
-                                f"dist={info.get('distance', 0):.3f}",
+                                f"H={last_entropy:.4f}  dist={info.get('distance', 0):.3f}",
                                 flush=True,
                             )
                         ep_rewards[i] = 0.0
@@ -236,7 +287,22 @@ def train(args: argparse.Namespace) -> None:
                         if CHECKPOINT_EVERY > 0 and episode % CHECKPOINT_EVERY == 0:
                             os.makedirs(MODELS_DIR, exist_ok=True)
                             agent.save(MODEL_PATH)
-                            print(f"[train] Checkpoint → {MODEL_PATH}", flush=True)
+                            print(
+                                f"[train] Checkpoint saved → {_checkpoint_path()}",
+                                flush=True,
+                            )
+
+                if _perf_steps >= PERF_INTERVAL:
+                    elapsed = time.monotonic() - _perf_t0
+                    sps = _perf_steps / elapsed if elapsed > 0 else 0.0
+                    stats = _gpu_stats()
+                    print(
+                        f"[train] {global_step:>8} steps | {sps:>6.1f} steps/sec"
+                        + (f"  |  {stats}" if stats else ""),
+                        flush=True,
+                    )
+                    _perf_t0 = time.monotonic()
+                    _perf_steps = 0
 
             _, _, last_values = agent.act_batch(obs_batch, training=False)
 
@@ -272,10 +338,13 @@ def train(args: argparse.Namespace) -> None:
             )
             if metrics:
                 recent_losses.append(float(metrics.get("loss", 0.0)))
+                last_entropy = float(metrics.get("entropy", last_entropy))
+                if len(recent_losses) > 50:
+                    recent_losses.pop(0)
 
         os.makedirs(MODELS_DIR, exist_ok=True)
         agent.save(MODEL_PATH)
-        print(f"[train] Model saved → {MODEL_PATH}", flush=True)
+        print(f"[train] Model saved → {_checkpoint_path()}", flush=True)
 
         csv_path = _save_training_csv(
             history_ep, history_reward, history_avg_loss, history_success
