@@ -43,15 +43,10 @@ environment:
   target_z_range: 0.08
 
 rewards:
-  mode: normalized_progress
-  progress_clip: 1.0
-  success_bonus: 1.0
-  reward_scale: 1.0
-  use_early_truncation: false
-  early_truncation_sum_threshold: -2.0
   closer: 1.0
   farther: -1.0
   same: 0.0
+  success_bonus: 5.0
 
 preprocessing:
   width: 84

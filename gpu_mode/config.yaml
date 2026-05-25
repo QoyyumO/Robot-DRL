@@ -45,18 +45,12 @@ environment:
   target_z_min: 0.05
   target_z_range: 0.08     # z uniformly sampled in [z_min, z_min + z_range]
 
-# --- Reward Shaping (Option A: normalized progress) ---
+# --- Reward Shaping (sign-step: +1 closer, -1 farther, +5 on success) ---
 rewards:
-  mode: normalized_progress     # progress = (prev_dist - dist) / initial_dist, clipped
-  progress_clip: 1.0            # per-step reward in [-clip, +clip]
-  success_bonus: 1.0            # terminal bonus on reach (keep small for stable Q-learning)
-  reward_scale: 1.0             # multiply all rewards before returning (global scale)
-  use_early_truncation: false   # disable 3-step fail-fast while testing new reward
-  early_truncation_sum_threshold: -2.0  # only if use_early_truncation: true (sum of last 3 step rewards)
-  # legacy sign_step mode only (set mode: sign_step):
   closer: 1.0
   farther: -1.0
   same: 0.0
+  success_bonus: 5.0
 
 # --- Image Preprocessing ---
 preprocessing:
