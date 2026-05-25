@@ -1,0 +1,15 @@
+# Requirements for gpu_mode (Google Colab GPU / headless training)
+# Install in Colab with: pip install -r gpu_mode/requirements.txt
+#
+# NOT included vs the full project:
+#   - openvino: Intel-only (CPU/iGPU), won't use Colab's NVIDIA GPU
+#   - Pillow:   only needed for tkinter GUI display (not used here)
+#
+# TensorFlow will automatically use the Colab CUDA GPU when available.
+
+opencv-python-headless>=4.5.0   # headless build: no Qt/GTK display dependency
+numpy>=1.19.0
+pybullet>=3.2.0
+tensorflow>=2.8.0
+matplotlib>=3.5.0               # used with Agg backend (file-only, no display)
+pyyaml>=6.0                     # required for loading config.yaml

@@ -1,15 +1,52 @@
 # Vision-Based Robotic Arm Control
 
-A reinforcement learning project for controlling a two-joint robotic arm using vision only. The DQN agent observes the simulation as an 84×84 image (arm + target) and learns to reach a target. Training uses TensorFlow; deployment can use OpenVINO for inference.
+A reinforcement learning project for controlling a two-joint robotic arm using vision only. The DQN agent observes the simulation as an 84×84 image (arm + target) and learns to reach a target. Training runs on Google Colab GPU; deployment uses OpenVINO via the local demo GUI.
 
 ## Requirements
 
 - Python 3.8+
-- See `requirements.txt` for dependencies (OpenCV, NumPy, Pillow, PyBullet, TensorFlow, OpenVINO, Matplotlib).
+- **Training (Colab):** see `gpu_mode/requirements.txt` (TensorFlow, PyBullet, OpenCV, etc.)
+- **Local demo:** see `requirements.txt` (adds Pillow, OpenVINO for GUI and IR conversion)
 
-## Setup
+## Training on Google Colab (GPU)
 
-1. **Clone the repository** (or extract the project folder).
+1. In Colab, set **Runtime → Change runtime type → T4 GPU** (or better), then restart the runtime.
+
+2. Run:
+
+```python
+!git clone -b gpu_v https://github.com/QoyyumO/Robot-DRL.git
+!cd /content/Robot-DRL
+!pip install -r /content/Robot-DRL/gpu_mode/requirements.txt
+!python /content/Robot-DRL/gpu_mode/train.py --episodes 10000 --log-every 100
+```
+
+3. Outputs are written under `/content/Robot-DRL/`:
+   - `models/dqn_model.keras` — checkpoint (download for local use)
+   - `logs/training_metrics_*.csv` and `logs/training_plot_*.png` — metrics
+
+Optional flags: `--resume` (continue from checkpoint), `--n-envs 4` (parallel envs, default in config).
+
+**Other algorithms (same Colab pattern):**
+
+```python
+# PPO
+!pip install -r /content/Robot-DRL/gpu_mode_ppo/requirements.txt
+!python /content/Robot-DRL/gpu_mode_ppo/train.py --episodes 10000 --log-every 100
+
+# SAC
+!pip install -r /content/Robot-DRL/gpu_mode_sac/requirements.txt
+!python /content/Robot-DRL/gpu_mode_sac/train.py --episodes 10000 --log-every 100
+```
+
+## Local setup (demo & conversion)
+
+1. **Clone the repository** (or copy your trained `models/` and `logs/` from Colab):
+
+   ```bash
+   git clone -b gpu_v https://github.com/QoyyumO/Robot-DRL.git
+   cd Robot-DRL
+   ```
 
 2. **Create and activate a virtual environment** (recommended):
 
@@ -27,29 +64,31 @@ A reinforcement learning project for controlling a two-joint robotic arm using v
    pip install -r requirements.txt
    ```
 
-## How to Run
+4. Place the trained checkpoint at `models/dqn_model.keras` (from Colab).
 
-1. **Launch the GUI dashboard:**
+## Demo GUI (local)
 
-   ```bash
-   python main_gui.py
-   ```
+```bash
+python main_gui.py
+```
 
-2. **From the dashboard you can:**
-   - **Start Training** – Run DQN training in the PyBullet simulation (saves model to `models/dqn_model.keras` and logs/plots to `logs/`).
-   - **Convert model → OpenVINO IR** – Export the trained model to OpenVINO format (`.xml`/`.bin`) for faster inference.
-   - **Run OpenVINO Inference** – Run the policy using the OpenVINO IR model (requires having run conversion first).
-   - **Stop** – Stop the current training or inference run.
+From the dashboard:
 
-3. **Optional: run without GUI** – The core logic lives in `environment.py` (PyBullet env), `agent.py` (DQN + OpenVINO), and `utils.py` (image preprocessing). You can import these and run training or inference from your own script.
+- **Convert model → OpenVINO IR** — export `models/dqn_model.keras` to `openvino_ir/dqn_ir.xml` / `.bin`
+- **Run OpenVINO Demo Mode** — run the policy on preset targets (logs to `logs/`)
+- **Stop** — stop the current demo
 
-## Project Structure
+## Project structure
 
-- `main_gui.py` – Tkinter dashboard (training, inference, model conversion).
-- `environment.py` – PyBullet environment for the two-joint arm and target.
-- `agent.py` – DQN agent (TensorFlow) and OpenVINO inference.
-- `utils.py` – Frame preprocessing (resize, grayscale, normalization).
-- `robot_urdf/` – URDF and assets for the robotic arm.
-- `requirements.txt` – Python dependencies.
-
-Training outputs are saved under `models/` and `logs/` (create these if they don’t exist).
+| Path | Purpose |
+|------|---------|
+| `gpu_mode/` | Headless DQN training (Colab GPU) |
+| `gpu_mode_ppo/` | PPO training (Colab) |
+| `gpu_mode_sac/` | SAC training (Colab) |
+| `main_gui.py` | Demo dashboard + OpenVINO conversion |
+| `environment.py` | PyBullet environment |
+| `agent.py` | DQN (training) and OpenVINO inference |
+| `utils.py` | Image preprocessing (84×84) |
+| `robot_urdf/` | Arm URDF and assets |
+| `models/` | Saved checkpoints |
+| `logs/` | Training and demo logs |
